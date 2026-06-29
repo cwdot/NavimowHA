@@ -19,6 +19,7 @@ from mower_sdk.models import (
 from mower_sdk.sdk import NavimowSDK
 
 from .const import (
+    CHARGE_STALL_TIMEOUT,
     DOMAIN,
     HTTP_FALLBACK_MIN_INTERVAL,
     MQTT_STALE_SECONDS,
@@ -26,6 +27,53 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class ChargeTracker:
+    """Infers charging state from successive battery readings.
+
+    The Navimow SDK never reports a charging status — its ``MowerStatus.CHARGING``
+    value is unreachable because the cloud ``vehicleState`` has no charging value
+    and the docked mower reports ``isDocked``. Charging is therefore inferred from
+    the battery trend: a rising level means charging, a falling level means not,
+    and a level that has been flat beyond the stall window (while not full) is
+    treated as no longer charging (e.g. dock not seated, charging fault).
+    """
+
+    def __init__(self, stall_timeout: float) -> None:
+        self._stall_timeout = stall_timeout
+        self._charging: bool | None = None
+        self._last_battery: int | None = None
+        self._last_rise: float | None = None
+
+    @property
+    def charging(self) -> bool | None:
+        return self._charging
+
+    def observe(self, battery: int | None, now: float) -> bool | None:
+        """Feed a battery reading; returns the inferred charging state."""
+        if battery is None:
+            return self._charging
+        prev = self._last_battery
+        if prev is None:
+            # First reading: no trend yet, charging stays unknown.
+            self._last_battery = battery
+            self._last_rise = now
+            return self._charging
+        if battery > prev:
+            self._charging = True
+            self._last_rise = now
+        elif battery < prev:
+            self._charging = False
+        elif (
+            self._charging
+            and battery < 100
+            and self._last_rise is not None
+            and now - self._last_rise > self._stall_timeout
+        ):
+            self._charging = False
+        self._last_battery = battery
+        return self._charging
 
 
 class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -56,6 +104,12 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_mqtt_state_update: float | None = None
         self._last_http_fetch: float | None = None
         self._last_data_source: str | None = None
+        self._charge = ChargeTracker(CHARGE_STALL_TIMEOUT)
+
+    @property
+    def charging(self) -> bool | None:
+        """Inferred battery charging state (None until a trend is known)."""
+        return self._charge.charging
 
     async def async_setup(self) -> None:
         """Register callbacks from SDK."""
@@ -72,6 +126,7 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "last_mqtt_update_monotonic": self._last_mqtt_update,
                 "last_mqtt_state_update_monotonic": self._last_mqtt_state_update,
                 "last_http_fetch_monotonic": self._last_http_fetch,
+                "charging": self._charge.charging,
             },
         }
 
@@ -174,6 +229,7 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._last_state = self._device_status_to_state(status)
                 self._last_http_fetch = now
                 self._last_data_source = "http_fallback"
+                self._charge.observe(self._last_state.battery, now)
                 # Push immediately so entities update without waiting for the
                 # next coordinator tick.
                 self.data = self._build_data()
@@ -185,13 +241,19 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "HTTP fallback failed for device %s: %s", self.device.id, err
                 )
 
+        # Covers the mqtt_cache path (battery from cached state); the fallback
+        # path already observed above, re-observing the same value is a no-op.
+        if self._last_state is not None:
+            self._charge.observe(self._last_state.battery, now)
+
         _LOGGER.debug(
-            "Coordinator update: device=%s source=%s mqtt_ts=%s mqtt_state_ts=%s http_ts=%s",
+            "Coordinator update: device=%s source=%s mqtt_ts=%s mqtt_state_ts=%s http_ts=%s charging=%s",
             self.device.id,
             self._last_data_source,
             self._last_mqtt_update,
             self._last_mqtt_state_update,
             self._last_http_fetch,
+            self._charge.charging,
         )
         self.data = self._build_data()
         return self.data
@@ -224,6 +286,7 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _update_from_state(self, state: DeviceStateMessage) -> None:
         self._last_state = state
         self._last_data_source = "mqtt_push"
+        self._charge.observe(state.battery, time.monotonic())
         self.async_set_updated_data(self._build_data())
 
     def _update_from_attributes(self, attrs: DeviceAttributesMessage) -> None:

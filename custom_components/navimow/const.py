@@ -45,6 +45,11 @@ MQTT_KEEPALIVE_SECONDS: Final = 120
 # 当 MQTT 实时状态缺失时，回退到 HTTP，避免状态长时间卡住。
 HTTP_FALLBACK_MIN_INTERVAL: Final = 300
 
+# Charging is inferred from the battery trend because the SDK never reports a
+# charging status. A charge level that has been flat for this many seconds
+# (while not full) is treated as no longer charging (e.g. dock not seated).
+CHARGE_STALL_TIMEOUT: Final = 3600
+
 # MowerStatus 到 LawnMowerActivity 的映射
 MOWER_STATUS_TO_ACTIVITY = {
     "idle": "docked",
